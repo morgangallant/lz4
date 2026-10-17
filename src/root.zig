@@ -141,6 +141,8 @@ const DataBlockSize = packed struct(u32) {
     is_uncompressed: u1,
 };
 
+// Read a sequence of data blocks from the reader, decompressing if necessary.
+// Returns the total number of bytes written to the output (`out`).
 pub fn readDataBlocks(
     allocator: std.mem.Allocator,
     rdr: *Io.Reader,
@@ -158,17 +160,20 @@ pub fn readDataBlocks(
             return error.BlockSizeExceedsMax;
         }
 
+        // This is relatively important - we pass a limited reader to the decompress
+        // function, to ensure it can detect the end of the block (error.EndOfStream).
         var buffer: [4096]u8 = undefined;
         var block_reader = rdr.limited(.limited(data_block_size.size), &buffer);
         written += blk: switch (data_block_size.is_uncompressed) {
             0 => {
-                break :blk try decompressLZ4Block(allocator, &block_reader.interface, out);
+                break :blk try decompressLZ4Blocks(allocator, &block_reader.interface, out);
             },
             1 => {
                 @panic("todo: support uncompressed blocks");
             },
         };
 
+        // If the block checksum flag is set, read and verify the checksum.
         if (header.flg.block_checksum == 1) {
             _ = try rdr.takeInt(u32, .little);
             @panic("todo: implement block checksum verification");
@@ -177,13 +182,14 @@ pub fn readDataBlocks(
     return written;
 }
 
-fn decompressLZ4Block(
+fn decompressLZ4Blocks(
     allocator: std.mem.Allocator,
     rdr: *Io.Reader,
     out: *std.ArrayList(u8),
 ) !usize {
     var written: usize = 0;
     while (true) {
+        // Always starts with a token byte.
         const token_byte = try rdr.takeInt(u8, .little);
         const token: Token = @fromBackingInt(token_byte);
 
@@ -206,7 +212,8 @@ fn decompressLZ4Block(
             written += literal_length;
         }
 
-        // Now, read the match offset and match length.
+        // An LZ4 block will end with a missing match offset, e.g.
+        // the end of the block is reached when we cannot read a match offset.
         const match_offset = rdr.takeInt(u16, .little) catch |err| switch (err) {
             error.EndOfStream => break, // No offset indicates the end of the block.
             else => return err,
@@ -214,6 +221,10 @@ fn decompressLZ4Block(
         if (match_offset == 0) {
             return error.InvalidMatchOffset;
         }
+
+        // The match length is 4 + the value in the token.
+        // If the token value is 15, then we'll read subsequent
+        // bytes to determine the total match length.
         var match_length: usize = token.match_length;
         if (match_length == 15) {
             while (true) {
@@ -235,15 +246,11 @@ fn decompressLZ4Block(
         const match_bytes = out.items[match_start..match_end];
         const dst = try out.addManyAsSlice(allocator, match_length);
         @memcpy(dst, match_bytes);
+
         written += match_length;
     }
 
     return written;
-}
-
-fn readToken(rdr: *Io.Reader) !Token {
-    const token_byte = try rdr.takeInt(u8, .little);
-    return @fromBackingInt(token_byte);
 }
 
 // `LICENSE.lz4` was compressed with the reference `lz4` CLI tool.
