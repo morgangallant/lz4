@@ -102,6 +102,7 @@ fn decompressCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     const start: Io.Timestamp = .now(io, .awake);
 
     const frame_header = try lz4.readFrameHeader(input_rdr);
+    try output_buffer.ensureUnusedCapacity(gpa, try frame_header.sizeToPreallocate());
     const written_bytes = try lz4.readDataBlocks(
         gpa,
         input_rdr,

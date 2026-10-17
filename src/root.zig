@@ -75,6 +75,13 @@ const FrameHeader = struct {
     bd: BD,
     content_size: ?u64,
     dictionary_id: ?u32,
+
+    pub fn sizeToPreallocate(self: FrameHeader) !usize {
+        if (self.flg.content_size == 1) {
+            return self.content_size.?;
+        }
+        return self.bd.blockMaxSize();
+    }
 };
 
 // Small helper function to read a value of type `T` from the reader, updating the hash.
