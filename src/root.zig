@@ -25,25 +25,28 @@ const BD = packed struct(u8) {
     // Used to help decoder allocate memory for decompression.
     block_max_size: u3,
     reserved2: u1,
+
+    pub fn blockMaxSize(self: BD) !usize {
+        return switch (self.block_max_size) {
+            4 => 64 * 1024,
+            5 => 256 * 1024,
+            6 => 1 * 1024 * 1024,
+            7 => 4 * 1024 * 1024,
+            else => return error.UnsupportedBlockMaxSize,
+        };
+    }
 };
 
 const Token = packed struct(u8) {
-    // Total number of literal bytes.
-    // If the value is 15, then subsequent bytes are read to determine the actual length.
-    // Each subsequent byte adds 255 to the length until a byte less than 255 is found.
-    literal_length: u4,
-
     // The number of bytes to copy from the previous match. If the value is 15,
     // Like `literal_length`, subsequent bytes are read to determine the actual length.
     // Each subsequent byte adds 255 to the length until a byte less than 255 is found.
     match_length: u4,
-};
 
-// The block size is stored as a 31-bit integer, with the highest bit indicating
-// whether the block is compressed with LZ4 or not.
-const DataBlockSize = packed struct(u32) {
-    size: u31,
-    is_uncompressed: u1,
+    // Total number of literal bytes.
+    // If the value is 15, then subsequent bytes are read to determine the actual length.
+    // Each subsequent byte adds 255 to the length until a byte less than 255 is found.
+    literal_length: u4,
 };
 
 // Compresses the input data using the LZ4 algorithm, writing the output
@@ -65,238 +68,182 @@ pub fn compress(
     return written;
 }
 
-// 04 22 4d 18 - Magic Number
-// 64 - FLG (01000000) (version=01, block_independence=
-//
-// 64 40 a7 9c
-// 03 00 00 f3 a9 4d 49 54
+// The frame header consists of the FLG and BD bytes, followed by optional
+// content size and dictionary ID fields. It is checksummed w/ XXHash32.
+const FrameHeader = struct {
+    flg: FLG,
+    bd: BD,
+    content_size: ?u64,
+    dictionary_id: ?u32,
+};
 
-// Decompresses an LZ4 frame from the input data, writing to the provided `ArrayList`.
-// Returns the number of bytes written to the output.
-fn decompressFrame(
-    allocator: std.mem.Allocator,
-    input: []const u8,
-    output: *std.ArrayList(u8),
-) !usize {
-    const written: usize = 0;
-    var offset: usize = 0;
+// Small helper function to read a value of type `T` from the reader, updating the hash.
+fn takeAndHash(comptime T: type, rdr: *Io.Reader, hasher: *XxHash32) !T {
+    const arr = try rdr.takeArray(@sizeOf(T));
+    hasher.update(arr);
+    return std.mem.readInt(T, arr, .little);
+}
 
-    // Magic number always comes first.
-    try readMagicNumber(input, &offset);
+// Parse a frame header from the reader, ensuring the magic
+// number and checksum match the expected values. Returns the
+// parsed frame header on success.
+pub fn readFrameHeader(rdr: *Io.Reader) !FrameHeader {
+    var hasher = XxHash32.init(0);
 
-    // Next, we decode the frame descriptor.
-    const flg, const bd = try readFLGAndBG(input, &offset);
+    // Magic number is not part of the hash.
+    const magic_number = try rdr.takeInt(u32, .little);
+    if (magic_number != MAGIC_NUMBER) {
+        return error.InvalidMagicNumber;
+    }
 
+    const fg_byte = try takeAndHash(u8, rdr, &hasher);
+    const flg: FLG = @fromBackingInt(fg_byte);
     if (flg.version != 1) {
         return error.UnsupportedVersion;
-    } else if (flg.reserved != 0 or bd.reserved != 0 or bd.reserved2 != 0) {
+    } else if (flg.reserved != 0) {
         return error.UnsupportedReservedBits;
     }
 
-    // Determine how much space to pre-allocate for the output buffer.
-    // If the content size is included, then we can use that to exactly
-    // pre-allocate the output buffer. Otherwise, we use the block_max_size
-    // as an upper bound for the output buffer size.
-    const block_max_size: usize = switch (bd.block_max_size) {
-        4 => 64 * 1024,
-        5 => 256 * 1024,
-        6 => 1 * 1024 * 1024,
-        7 => 4 * 1024 * 1024,
-        else => return error.UnsupportedBlockSize,
-    };
-    const preallocate_amount = blk: {
-        if (flg.content_size == 1) {
-            const content_size = try readInt(u64, input, &offset);
-            break :blk content_size;
-        }
-        break :blk block_max_size;
-    };
-    try output.ensureUnusedCapacity(allocator, preallocate_amount);
-
-    // If the dictionary ID is included, read it now.
-    const dictionary_id: ?u32 = if (flg.dict_id == 1)
-        try readInt(u32, input, &offset)
-    else
-        null;
-    if (dictionary_id) |_| {
-        @panic("dict id not supported yet");
+    const bd_byte = try takeAndHash(u8, rdr, &hasher);
+    const bd: BD = @fromBackingInt(bd_byte);
+    if (bd.reserved != 0 or bd.reserved2 != 0) {
+        return error.UnsupportedReservedBits;
     }
 
-    // The final byte of the frame descriptor is a checksum.
-    // Specifically, just the lower 8 bits of the XXHash32 of the frame descriptor.
-    {
-        const computed_checksum = (contentHash(input[4..offset]) >> 8) & 0xFF;
-        const expected_checksum = try readInt(u8, input, &offset);
-        if (expected_checksum != computed_checksum) {
-            return error.InvalidHeaderChecksum;
-        }
+    var content_size: ?u64 = null;
+    if (flg.content_size == 1) {
+        content_size = try takeAndHash(u64, rdr, &hasher);
     }
 
-    // Now, we read data blocks.
+    var dictionary_id: ?u32 = null;
+    if (flg.dict_id == 1) {
+        dictionary_id = try takeAndHash(u32, rdr, &hasher);
+    }
+
+    const expected_checksum = try rdr.takeInt(u8, .little);
+    const computed_checksum = (hasher.final() >> 8) & 0xFF;
+    if (expected_checksum != computed_checksum) {
+        return error.InvalidHeaderChecksum;
+    }
+
+    return .{
+        .flg = flg,
+        .bd = bd,
+        .content_size = content_size,
+        .dictionary_id = dictionary_id,
+    };
+}
+
+// The block size is stored as a 31-bit integer, with the highest bit indicating
+// whether the block is compressed with LZ4 or not.
+const DataBlockSize = packed struct(u32) {
+    size: u31,
+    is_uncompressed: u1,
+};
+
+pub fn readDataBlocks(
+    allocator: std.mem.Allocator,
+    rdr: *Io.Reader,
+    header: FrameHeader,
+    out: *std.ArrayList(u8),
+) !usize {
+    var written: usize = 0;
     while (true) {
-        const block_size_int = try readInt(u32, input, &offset);
+        const block_size_int = try rdr.takeInt(u32, .little);
         if (block_size_int == 0) {
             break; // End mark.
         }
         const data_block_size: DataBlockSize = @fromBackingInt(block_size_int);
-        if (data_block_size.size > block_max_size) {
+        if (data_block_size.size > try header.bd.blockMaxSize()) {
             return error.BlockSizeExceedsMax;
         }
-        std.debug.print("data_block_size: size={} is_uncompressed={}\n", .{ data_block_size.size, data_block_size.is_uncompressed });
-        const n_written: usize = blk: switch (data_block_size.is_uncompressed) {
+
+        var buffer: [4096]u8 = undefined;
+        var block_reader = rdr.limited(.limited(data_block_size.size), &buffer);
+        written += blk: switch (data_block_size.is_uncompressed) {
             0 => {
-                break :blk try decompressBlock(allocator, input, &offset, output);
+                break :blk try decompressLZ4Block(allocator, &block_reader.interface, out);
             },
             1 => {
-                const block_size: usize = data_block_size.size;
-                if (input[offset..].len < block_size) {
-                    return error.InvalidInput;
-                }
-                const block = input[offset .. offset + block_size];
-                offset += block_size;
-                try output.appendSlice(allocator, block);
-                break :blk block_size;
+                @panic("todo: support uncompressed blocks");
             },
         };
-        if (flg.block_checksum == 1) {
-            const expected_checksum = try readInt(u32, input, &offset);
-            const computed_checksum = contentHash(output.items[output.items.len - n_written ..]);
-            if (expected_checksum != computed_checksum) {
-                return error.InvalidBlockChecksum;
-            }
+
+        if (header.flg.block_checksum == 1) {
+            _ = try rdr.takeInt(u32, .little);
+            @panic("todo: implement block checksum verification");
         }
     }
-
-    // Verify the content checksum if it is included.
-    if (flg.content_checksum == 1) {
-        const expected_checksum = try readInt(u32, input, &offset);
-        const computed_checksum = contentHash(output.items);
-        if (expected_checksum != computed_checksum) {
-            return error.InvalidContentChecksum;
-        }
-    }
-
     return written;
 }
 
-// Reads and validates the magic number from the input slice, updating the offset.
-fn readMagicNumber(input: []const u8, offset: *usize) !void {
-    const magic_value = try readInt(u32, input, offset);
-    if (magic_value != MAGIC_NUMBER) {
-        return error.InvalidMagicNumber;
-    }
-}
-
-// Reads the FLG and BD bytes from the input slice, updating the offset.
-fn readFLGAndBG(input: []const u8, offset: *usize) !struct { FLG, BD } {
-    const flg_byte = try readInt(u8, input, offset);
-    const flg: FLG = @fromBackingInt(flg_byte);
-    std.debug.print("flg_byte={b}\n", .{flg_byte});
-    std.debug.print("flg: version={} block_independence={} block_checksum={} content_size={} content_checksum={} reserved={} dict_id={}\n", .{ flg.version, flg.block_independence, flg.block_checksum, flg.content_size, flg.content_checksum, flg.reserved, flg.dict_id });
-
-    const bd_byte = try readInt(u8, input, offset);
-    const bd: BD = @fromBackingInt(bd_byte);
-    std.debug.print("bd_byte={b}\n", .{bd_byte});
-    std.debug.print("bd: reserved={} block_max_size={} reserved2={}\n", .{ bd.reserved, bd.block_max_size, bd.reserved2 });
-
-    return .{ flg, bd };
-}
-
-// Decompresses a block of LZ4-compressed data, writing the output to the
-// provided `ArrayList`. Returns the number of bytes written to the output.
-fn decompressBlock(
+fn decompressLZ4Block(
     allocator: std.mem.Allocator,
-    input: []const u8,
-    offset: *usize,
-    output: *std.ArrayList(u8),
+    rdr: *Io.Reader,
+    out: *std.ArrayList(u8),
 ) !usize {
     var written: usize = 0;
+    while (true) {
+        const token_byte = try rdr.takeInt(u8, .little);
+        const token: Token = @fromBackingInt(token_byte);
 
-    const token = try readToken(input, offset);
+        // Compute the literal length from the token.
+        // If the literal length is 15, then we need to read
+        // subsequent bytes to determine the total length.
+        var literal_length: usize = token.literal_length;
+        if (literal_length == 15) {
+            while (true) {
+                const byte = try rdr.takeInt(u8, .little);
+                literal_length += byte;
+                if (byte != 255) break;
+            }
+        }
 
-    // If the literal length is 15, then we need to read
-    // the following bytes to determine the actual length.
-    var literal_length: usize = token.literal_length;
-    if (literal_length == 15) {
-        literal_length += try readLSIC(input, offset);
-    }
-    std.debug.print("literal_length={}\n", .{literal_length});
+        // Write the literal bytes to the output.
+        if (literal_length > 0) {
+            const dst = try out.addManyAsSlice(allocator, literal_length);
+            try rdr.readSliceAll(dst);
+            written += literal_length;
+        }
 
-    // At this point, we have a literal length, so we literally
-    // can copy that many bytes from the input to the output.
-    if (input[offset.*..].len < literal_length) {
-        return error.InvalidInput;
-    }
-    const literal = input[offset.* .. offset.* + literal_length];
-    try output.appendSlice(allocator, literal);
-    offset.* += literal_length;
-    written += literal_length;
+        // Now, read the match offset and match length.
+        const match_offset = rdr.takeInt(u16, .little) catch |err| switch (err) {
+            error.EndOfStream => break, // No offset indicates the end of the block.
+            else => return err,
+        };
+        if (match_offset == 0) {
+            return error.InvalidMatchOffset;
+        }
+        var match_length: usize = token.match_length;
+        if (match_length == 15) {
+            while (true) {
+                const byte = try rdr.takeInt(u8, .little);
+                match_length += byte;
+                if (byte != 255) break;
+            }
+        }
+        match_length += 4; // The match length is always at least 4.
 
-    // Now, read the offset, and the match length.
-    const match_offset = try readInt(u16, input, offset);
-    var match_length: usize = token.match_length;
-    if (match_length == 15) {
-        match_length += try readLSIC(input, offset);
+        // Copy the match bytes from the output buffer.
+        const match_start = out.items.len - match_offset;
+        const match_end = match_start + match_length;
+        if (match_start >= out.items.len) {
+            return error.InvalidMatchOffset;
+        } else if (match_end > out.items.len) {
+            return error.InvalidMatchLength;
+        }
+        const match_bytes = out.items[match_start..match_end];
+        const dst = try out.addManyAsSlice(allocator, match_length);
+        @memcpy(dst, match_bytes);
+        written += match_length;
     }
-    match_length += 4; // The minimum match length is 4.
-    std.debug.print("match_offset={} match_length={}\n", .{ match_offset, match_length });
-
-    // Now, we need to copy `match_length` bytes from the output buffer,
-    // starting at `match_offset` bytes before the current end of the output.
-    if (match_offset == 0 or match_offset > output.items.len) {
-        return error.InvalidInput;
-    }
-    const match_start = output.items.len - match_offset;
-    if (match_start + match_length > output.items.len) {
-        return error.InvalidInput;
-    }
-    const match_bytes = output.items[match_start .. match_start + match_length];
-    try output.appendSlice(allocator, match_bytes);
-    written += match_length;
 
     return written;
 }
 
-// Reads a Token from the input slice, updating offset.
-fn readToken(input: []const u8, offset: *usize) !Token {
-    const token_byte = try readInt(u8, input, offset);
+fn readToken(rdr: *Io.Reader) !Token {
+    const token_byte = try rdr.takeInt(u8, .little);
     return @fromBackingInt(token_byte);
-}
-
-// Reads a variable-length integer from the input slice, starting at the
-// given offset. For each byte read, adds its value to the total until
-// a byte less than 255 is encountered. Updates offset along the way,
-// returning the total value read.
-fn readLSIC(input: []const u8, offset: *usize) !u32 {
-    var value: u32 = 0;
-    while (true) {
-        const byte = try readInt(u8, input, offset);
-        value += byte;
-        if (byte != 255) break;
-    }
-    return value;
-}
-
-// Reads an integer of type `T` from the input slice, starting at the given offset.
-// Updates the offset and returns the integer value read.
-fn readInt(comptime T: type, input: []const u8, offset: *usize) !T {
-    const size = @sizeOf(T);
-    if (offset.* + size > input.len) {
-        return error.InvalidInput;
-    }
-    const int_bytes = input[offset.* .. offset.* + size][0..size];
-    offset.* += size;
-    return std.mem.readInt(T, int_bytes, .little);
-}
-
-// Hashes a byte slice using the XXHash32 algorithm, used by LZ4.
-fn contentHash(data: []const u8) u32 {
-    const seed = 0; // From the LZ4 spec.
-    return XxHash32.hash(seed, data);
-}
-
-pub fn name() []const u8 {
-    return "lz4";
 }
 
 // `LICENSE.lz4` was compressed with the reference `lz4` CLI tool.
@@ -305,19 +252,24 @@ test "decompress lz4-cli output" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const compressed = try std.Io.Dir.cwd().readFileAlloc(
+    const compressed_file_path = "LICENSE.lz4";
+    const f = try std.Io.Dir.cwd().openFile(
         io,
-        "LICENSE.lz4",
-        allocator,
-        .unlimited,
+        compressed_file_path,
+        .{ .mode = .read_only },
     );
-    defer allocator.free(compressed);
+    defer f.close(io);
+
+    var buffer: [4096]u8 = undefined;
+    var reader = f.reader(io, &buffer);
+    const rdr = &reader.interface;
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    const n_written = try decompressFrame(allocator, compressed, &output);
-    try std.testing.expectEqual(output.items.len, n_written);
+    const header = try readFrameHeader(rdr);
+    const written = try readDataBlocks(allocator, rdr, header, &output);
+    try std.testing.expectEqual(output.items.len, written);
 
     const expected = try std.Io.Dir.cwd().readFileAlloc(
         io,
