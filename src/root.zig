@@ -53,19 +53,13 @@ const Token = packed struct(u8) {
 // to the provided `ArrayList`. Returns the number of bytes written to the output.
 pub fn compress(
     allocator: std.mem.Allocator,
-    input: []const u8,
-    output: Io.Writer,
+    rdr: *Io.Reader,
+    output: *std.ArrayList(u8),
 ) !usize {
     _ = allocator;
-    _ = input;
-
-    var written: usize = 0;
-
-    // Magic number always comes first.
-    try output.writeInt(u32, MAGIC_NUMBER, .little);
-    written += @sizeOf(u32);
-
-    return written;
+    _ = rdr;
+    _ = output;
+    return 0;
 }
 
 // The frame header consists of the FLG and BD bytes, followed by optional
@@ -294,4 +288,47 @@ test "decompress lz4-cli output" {
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, output.items);
+}
+
+test "compress & decompress roundtrip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const input_file_path = "LICENSE";
+    const input_file = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        input_file_path,
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(input_file);
+
+    const input_size = input_file.len;
+
+    var rdr: std.Io.Reader = .fixed(input_file);
+
+    var compressed: std.ArrayList(u8) = .empty;
+    defer compressed.deinit(allocator);
+
+    const written = try compress(allocator, &rdr, &compressed);
+    try std.testing.expectEqual(compressed.items.len, written);
+
+    // We expect the compressed output to be smaller than the input.
+    try std.testing.expect(compressed.items.len < input_size);
+
+    var decompressed: std.ArrayList(u8) = .empty;
+    defer decompressed.deinit(allocator);
+
+    var compressed_reader: std.Io.Reader = .fixed(compressed.items);
+    const header = try readFrameHeader(&compressed_reader);
+    const decompressed_written = try readDataBlocks(
+        allocator,
+        &compressed_reader,
+        header,
+        &decompressed,
+    );
+    try std.testing.expectEqual(decompressed.items.len, decompressed_written);
+
+    // The decompressed output should match the original input.
+    try std.testing.expectEqualStrings(input_file, decompressed.items);
 }
