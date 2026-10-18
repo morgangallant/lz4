@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      # Zig version comes from minimum_zig_version in build.zig.zon.
+      # Caches the global and local Zig caches across runs.
+      - uses: mlugg/setup-zig@v2
+      - run: zig build
+      - run: zig build test --summary all
