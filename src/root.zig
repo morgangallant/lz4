@@ -35,6 +35,24 @@ const BD = packed struct(u8) {
             else => return error.UnsupportedBlockMaxSize,
         };
     }
+
+    fn newForBlockSize(block_size: usize) !BD {
+        const block_max_size: u3 = if (block_size <= 64 * 1024)
+            4
+        else if (block_size <= 256 * 1024)
+            5
+        else if (block_size <= 1 * 1024 * 1024)
+            6
+        else if (block_size <= 4 * 1024 * 1024)
+            7
+        else
+            return error.UnsupportedBlockMaxSize;
+        return .{
+            .reserved = 0,
+            .block_max_size = block_max_size,
+            .reserved2 = 0,
+        };
+    }
 };
 
 const Token = packed struct(u8) {
@@ -49,17 +67,70 @@ const Token = packed struct(u8) {
     literal_length: u4,
 };
 
+// Allows customization of how data is compressed.
+const CompressionOptions = struct {
+    write_content_checksum: bool = true,
+    write_content_size: bool = false,
+    write_block_checksum: bool = false,
+};
+
 // Compresses the input data using the LZ4 algorithm, writing the output
 // to the provided `ArrayList`. Returns the number of bytes written to the output.
 pub fn compress(
     allocator: std.mem.Allocator,
-    rdr: *Io.Reader,
+    input: []const u8, // TODO input reader?
     output: *std.ArrayList(u8),
+    options: CompressionOptions,
 ) !usize {
-    _ = allocator;
-    _ = rdr;
-    _ = output;
-    return 0;
+    var allocating_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, output);
+    defer output.* = allocating_writer.toArrayList();
+    const w = &allocating_writer.writer;
+
+    // Keep track of the starting point to be able to return the number of written bytes
+    const start = allocating_writer.writer.end;
+
+    // Write the magic number to the output.
+    try w.writeInt(u32, MAGIC_NUMBER, .little);
+
+    // FLG byte.
+    const flg: FLG = .{
+        .dict_id = 0,
+        .reserved = 0,
+        .content_checksum = if (options.write_content_checksum) 1 else 0,
+        .content_size = if (options.write_content_size) 1 else 0,
+        .block_checksum = if (options.write_block_checksum) 1 else 0,
+        .block_independence = 1,
+        .version = 1,
+    };
+    const flg_byte: u8 = @backingInt(flg);
+    try w.writeInt(u8, flg_byte, .little);
+
+    // BD byte.
+    // TODO how do we handle inputs > 4MB?
+    const bd = try BD.newForBlockSize(input.len);
+    const bd_byte: u8 = @backingInt(bd);
+    try w.writeInt(u8, bd_byte, .little);
+
+    // If content size is included, write it to the output.
+    if (options.write_content_size) {
+        const content_size: u64 = @intCast(input.len);
+        try w.writeInt(u64, content_size, .little);
+    }
+
+    // TODO: Write the dictionary ID if included.
+
+    // Checksum the header (FLG, BD, and optional fields) using XXHash32,
+    // then write the bottom byte of the checksum to the output.
+    const header_checksum = hash: {
+        const written = allocating_writer.written();
+        const header_bytes = written[start + 4 ..]; // Doesn't include the magic number
+        const computed_hash = XxHash32.hash(0, header_bytes);
+        const top_byte: u8 = @truncate(computed_hash >> 8);
+        break :hash top_byte;
+    };
+    try w.writeInt(u8, header_checksum, .little);
+
+    return allocating_writer.writer.end - start;
 }
 
 // The frame header consists of the FLG and BD bytes, followed by optional
@@ -305,12 +376,10 @@ test "compress & decompress roundtrip" {
 
     const input_size = input_file.len;
 
-    var rdr: std.Io.Reader = .fixed(input_file);
-
     var compressed: std.ArrayList(u8) = .empty;
     defer compressed.deinit(allocator);
 
-    const written = try compress(allocator, &rdr, &compressed);
+    const written = try compress(allocator, input_file, &compressed, .{});
     try std.testing.expectEqual(compressed.items.len, written);
 
     // We expect the compressed output to be smaller than the input.
