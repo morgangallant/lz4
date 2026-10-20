@@ -130,7 +130,145 @@ pub fn compress(
     };
     try w.writeInt(u8, header_checksum, .little);
 
+    // Ok, now've written the header, we can actually start compressing
+    // the input data into blocks. We're going to follow the reference
+    // implementation's approach here.
+
+    var block: std.Io.Writer.Allocating = .init(allocator);
+    defer block.deinit();
+    try compressBlock(&block.writer, input);
+
+    // After compressing the block, write its length + contents,
+    // followed by an end mark.
+    try w.writeInt(u32, @intCast(block.written().len), .little);
+    try w.writeAll(block.written());
+    try w.writeInt(u32, 0, .little); // End mark.
+
+    // If we're writing a content checksum, write it out.
+    if (options.write_content_checksum) {
+        const content_checksum = XxHash32.hash(0, input);
+        try w.writeInt(u32, content_checksum, .little);
+    }
+
     return allocating_writer.writer.end - start;
+}
+
+const Match = struct {
+    offset: u16,
+    length: usize,
+};
+
+// Compress `input` into a single LZ4 block.
+fn compressBlock(w: *Io.Writer, input: []const u8) !void {
+    // For a given 4-byte sequence, stores the location of the last
+    // occurrence of that sequence in the input data.
+    var hash_table: [4096]u32 = @splat(0);
+
+    // For keeping track of where we are during iteration.
+    var i: usize = 0;
+
+    // The anchor point for literals we haven't written yet.
+    var anchor: usize = 0;
+
+    // Matches can't extend into the last 5 bytes.
+    const match_end_limit = input.len -| 5;
+
+    // The last match must start at least 12 bytes before the end.
+    while (i + 12 <= input.len) {
+        // Lookup where we last saw these 4 bytes, and record that we've
+        // now seen these bytes here.
+        const lookup_key_bytes = input[i .. i + 4][0..4];
+        const lookup_key = std.mem.readInt(u32, lookup_key_bytes, .little);
+        const hash_index = hash(lookup_key);
+        const candidate_match_idx = hash_table[hash_index];
+        hash_table[hash_index] = @intCast(i);
+
+        // For a match to be valid, it must:
+        // (a) occur before `i`
+        // (b) be within 65535 bytes of `i` (u16 offset)
+        // (c) actually match
+        const is_match = candidate_match_idx < i and
+            i - candidate_match_idx <= 65535 and
+            std.mem.readInt(
+                u32,
+                input[candidate_match_idx .. candidate_match_idx + 4][0..4],
+                .little,
+            ) == lookup_key;
+        if (!is_match) {
+            i += 1;
+            continue;
+        }
+
+        // We know the first four bytes match, try and extend it further.
+        var length: usize = 4;
+        while (i + length < match_end_limit and
+            input[candidate_match_idx + length] == input[i + length])
+        {
+            length += 1;
+        }
+
+        // Everything up until the last match is a literal.
+        const literal = input[anchor..i];
+        try writeSequence(w, literal, .{
+            .offset = @intCast(i - candidate_match_idx),
+            .length = length,
+        });
+
+        i += length;
+        anchor = i;
+    }
+
+    // The last block always ends with a literals-only sequence.
+    try writeSequence(w, input[anchor..], null);
+}
+
+// Writes a single sequence, e.g. composed of a token, literal, and optionally
+// a match and a length (for all blocks except the last).
+fn writeSequence(w: *Io.Writer, literals: []const u8, match: ?Match) !void {
+    // We store the match length as length - 4, since the minimum
+    // match length is 4.
+    const match_code = if (match) |m| m.length - 4 else 0;
+
+    // Prefix the sequence with a 1-byte token.
+    const token: Token = .{
+        .literal_length = @intCast(@min(literals.len, 15)),
+        .match_length = @intCast(@min(match_code, 15)),
+    };
+    try w.writeByte(@backingInt(token));
+
+    // May need to write extra bytes for a larger length.
+    if (literals.len >= 15) {
+        try writeExtraLength(w, literals.len - 15);
+    }
+
+    // Ok, now we write the literal.
+    try w.writeAll(literals);
+
+    // If we have a match, write the reference.
+    if (match) |m| {
+        try w.writeInt(u16, m.offset, .little);
+        if (match_code >= 15) {
+            try writeExtraLength(w, match_code - 15);
+        }
+    }
+}
+
+// If a length doesn't fit in the token's 4 bit value fields,
+// then we continue the length as a run of 255, ending w/ a byte
+// thats < 255.
+fn writeExtraLength(w: *Io.Writer, n: usize) !void {
+    var remaining = n;
+    while (remaining >= 255) : (remaining -= 255) {
+        try w.writeByte(255);
+    }
+    try w.writeByte(@intCast(remaining));
+}
+
+// The hash function used to map a 4-byte sequence to an index in the hash table.
+// Uses Knuth's multiplicative hash method with a prime number to reduce collisions.
+// We shift by 20 to get a 12-bit index, which gives us a hash table of size 4096.
+fn hash(seq: u32) u32 {
+    return (seq *% 2654435761) >> (32 - 12);
 }
 
 // The frame header consists of the FLG and BD bytes, followed by optional
