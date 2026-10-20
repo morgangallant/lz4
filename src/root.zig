@@ -446,21 +446,27 @@ fn decompressLZ4Blocks(
         match_length += 4; // The match length is always at least 4.
 
         // Copy the match bytes from the output buffer.
-        const match_start = out.items.len - match_offset;
-        const match_end = match_start + match_length;
-        if (match_start >= out.items.len) {
+        if (match_offset > out.items.len) {
             return error.InvalidMatchOffset;
-        } else if (match_end > out.items.len) {
-            return error.InvalidMatchLength;
         }
-        const match_bytes = out.items[match_start..match_end];
+        const match_start = out.items.len - match_offset;
         const dst = try out.addManyAsSlice(allocator, match_length);
-        @memcpy(dst, match_bytes);
+        copyMatch(dst, out.items[match_start..][0..match_length]);
 
         written += match_length;
     }
 
     return written;
+}
+
+// Safely copies a match from the source to the destination, handling overlapping regions.
+fn copyMatch(dst: []u8, src: []const u8) void {
+    const offset = @intFromPtr(dst.ptr) - @intFromPtr(src.ptr);
+    if (offset >= src.len) {
+        @memcpy(dst, src);
+    } else {
+        for (dst, src) |*d, s| d.* = s;
+    }
 }
 
 // `LICENSE.lz4` was compressed with the reference `lz4` CLI tool.
